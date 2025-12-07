@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Topdown Canvas</title>
+  <style>
+    :root { background:#0f0f0f; color:#d0d0d0; font-family:Inter, system-ui, -apple-system, sans-serif; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    canvas { display:block; width:100vw; height:100vh; }
+    .hud {
+      position:fixed; top:10px; left:10px; padding:12px 14px;
+      background:linear-gradient(135deg, rgba(20,20,30,0.85) 0%, rgba(40,40,60,0.75) 100%);
+      color:#d8e4ff; font-size:13px; font-weight:500;
+      border:1.5px solid rgba(100,150,255,0.4); border-radius:10px;
+      backdrop-filter:blur(8px); box-shadow: 0 0 20px rgba(74, 158, 255, 0.1);
+      font-family: 'Courier New', monospace;
+    }
+    .hud div { line-height:1.6; }
+    .menu-overlay {
+      position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7);
+      display:none; z-index:1000; justify-content:center; align-items:center;
+    }
+    .menu-overlay.active { display:flex; }
+    .menu-panel {
+      background:rgba(20,20,30,0.95); border:2px solid rgba(100,150,255,0.5); border-radius:12px;
+      padding:30px; max-width:500px; width:90%; max-height:80vh; overflow-y:auto;
+      backdrop-filter:blur(8px);
+    }
+    .menu-title {
+      font-size:24px; font-weight:bold; margin-bottom:20px; color:#4a9eff;
+    }
+    .menu-item {
+      padding:12px; margin:8px 0; background:rgba(50,50,80,0.5); border-radius:6px;
+      cursor:pointer; border:1px solid rgba(100,150,255,0.3); transition:all 0.2s;
+    }
+    .menu-item:hover { background:rgba(70,70,120,0.7); border-color:rgba(100,150,255,0.7); }
+    .menu-item.active { background:rgba(100,150,255,0.4); border-color:rgba(100,150,255,1); }
+    .hotkey-input {
+      background:rgba(20,20,40,0.8); color:#d8e4ff; border:1px solid rgba(100,150,255,0.5);
+      padding:8px 12px; border-radius:4px; font-family:monospace; font-size:13px;
+      width:100%; margin-top:5px; cursor:text;
+    }
+    .hotkey-row {
+      display:grid; grid-template-columns:1fr 1fr; gap:15px; margin:15px 0;
+    }
+    .hotkey-setting {
+      padding:10px; background:rgba(40,40,60,0.6); border-radius:6px;
+    }
+    .hotkey-label { font-size:12px; color:#999; margin-bottom:5px; }
+    .button-row {
+      display:flex; gap:10px; margin-top:20px;
+    }
+    .menu-btn {
+      flex:1; padding:10px; background:rgba(100,150,255,0.5); color:#fff; border:1px solid rgba(100,150,255,0.8);
+      border-radius:6px; cursor:pointer; transition:all 0.2s; font-size:14px;
+    }
+    .menu-btn:hover { background:rgba(100,150,255,0.7); }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div class="hud">
+    <div id="fps">FPS: --</div>
+    <div id="mem">Memory: N/A</div>
+    <div id="time">Time: 0.0s</div>
+    <div id="difficulty">Difficulty: 1.0x</div>
+    <div style="margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.1); font-size:11px;">
+      <div id="leaderboardPreview" style="color:#999; max-height:200px; overflow-y:auto;"></div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      let width = 0, height = 0, dpr = window.devicePixelRatio || 1;
+
+      const tileSize = 50;
+      const player = {
+        size: 40,
+        x: 200,
+        y: 200,
+        speed: 240, // px per second
+        color: '#4a9eff',
+        mouseX: 0,
+        mouseY: 0
+      };
+
+      const keysPressed = { w:false, a:false, s:false, d:false };
+
+      // Fixed hardcoded hotkeys (WASD only)
+      const hotkeys = {
+        up: 'w',
+        down: 's',
+        left: 'a',
+        right: 'd'
+      };
+
+      // Particle systems
+      const jetParticles = [];
+      const collectParticles = []; // Particles from key collection
+      const screenShakeAmount = { x: 0, y: 0 }; // For screen shake effects
+      
+      // Flashlight system
+      const flashlight = {
+        radius: 150,
+        windSampleGrid: 15, // Sample every 15 pixels in the cone
+        coneAngle: Math.PI / 3, // 60 degree cone
+        arrowLength: 30
+      };
+      
+      // Game state
+      let timeSurvived = 0;
+      let difficulty = 1;
+      let gameWon = false;
+      let gameLost = false;
+      let gameActive = true; // Game runs immediately on load
+      let lastSurvivalTime = 0;
+      let highScore = localStorage.getItem('gameHighScore') ? parseFloat(localStorage.getItem('gameHighScore')) : 0;
+      
+      // Leaderboard system
+      let leaderboard = [];
+      const maxLeaderboardEntries = 10;
+      const savedLeaderboard = localStorage.getItem('gameLeaderboard');
+      if (savedLeaderboard) {
+        leaderboard = JSON.parse(savedLeaderboard);
+      }
+      
+      // Key collection system
+      const keys = [];
+      const keysNeeded = 5;
+      let keysCollected = 0;
+      
+      function generateKeys() {
+        keys.length = 0;
+        keysCollected = 0;
+        for (let i = 0; i < keysNeeded; i++) {
+          let validPosition = false;
+          let x, y;
+          let attempts = 0;
+          const maxAttempts = 100;
+          // Keep generating until we find a position outside the kill zone
+          while (!validPosition && attempts < maxAttempts) {
+            attempts++;
+            x = Math.random() * (width - 200) + 100;
+            y = Math.random() * (height - 200) + 100;
+            // Check if position is NOT in kill zone
+            if (x >= killZoneWidth && x <= width - killZoneWidth &&
+                y >= killZoneWidth && y <= height - killZoneWidth) {
+              validPosition = true;
+            }
+          }
+          // If we couldn't find a valid position, use a safe default
+          if (!validPosition) {
+            x = width / 2 + Math.random() * 200 - 100;
+            y = height / 2 + Math.random() * 200 - 100;
+          }
+          keys.push({
+            x: x,
+            y: y,
+            collected: false,
+            size: 15,
+            rotation: Math.random() * Math.PI * 2
+          });
+        }
+      }
+      
+      // Red kill zone (hollow square around map perimeter)
+      const killZoneWidth = 100;
+      const jetZoneWidth = 150; // Jets positioned behind red zone
+      
+      // Generate perimeter jets
+      const jetSpacing = 10; // Even tighter spacing for very dense coverage
+      const jets = [];
+      let jetActivationTimer = 0;
+
+      function generatePerimeterJets() {
+        // Top edge (pushes down and slightly inward)
+        for (let x = 0; x < width; x += jetSpacing) {
+          jets.push({ x: x, y: -jetZoneWidth / 2, pushX: 0, pushY: 1200, active: false, activationDelay: Math.random() * 0.3 });
+        }
+        // Bottom edge (pushes up)
+        for (let x = 0; x < width; x += jetSpacing) {
+          jets.push({ x: x, y: height + jetZoneWidth / 2, pushX: 0, pushY: -1200, active: false, activationDelay: Math.random() * 0.3 });
+        }
+        // Left edge (pushes right)
+        for (let y = 0; y < height; y += jetSpacing) {
+          jets.push({ x: -jetZoneWidth / 2, y: y, pushX: 1200, pushY: 0, active: false, activationDelay: Math.random() * 0.3 });
+        }
+        // Right edge (pushes left)
+        for (let y = 0; y < height; y += jetSpacing) {
+          jets.push({ x: width + jetZoneWidth / 2, y: y, pushX: -1200, pushY: 0, active: false, activationDelay: Math.random() * 0.3 });
+        }
+        // Corners with diagonal push
+        jets.push({ x: -jetZoneWidth / 2, y: -jetZoneWidth / 2, pushX: 900, pushY: 900, active: false, activationDelay: Math.random() * 0.3 });
+        jets.push({ x: width + jetZoneWidth / 2, y: -jetZoneWidth / 2, pushX: -900, pushY: 900, active: false, activationDelay: Math.random() * 0.3 });
+        jets.push({ x: -jetZoneWidth / 2, y: height + jetZoneWidth / 2, pushX: 900, pushY: -900, active: false, activationDelay: Math.random() * 0.3 });
+        jets.push({ x: width + jetZoneWidth / 2, y: height + jetZoneWidth / 2, pushX: -900, pushY: -900, active: false, activationDelay: Math.random() * 0.3 });
+        
+        // Interior jets - randomly scattered throughout the map (avoiding kill zone)
+        const interiorJetCount = Math.floor((width * height) / 30000); // Significantly more interior jets
+        for (let i = 0; i < interiorJetCount; i++) {
+          let validPosition = false;
+          let x, y;
+          let attempts = 0;
+          const maxAttempts = 100;
+          // Keep generating until we find a position outside the kill zone
+          while (!validPosition && attempts < maxAttempts) {
+            attempts++;
+            x = Math.random() * (width - 200) + 100;
+            y = Math.random() * (height - 200) + 100;
+            // Check if position is NOT in kill zone
+            if (x >= killZoneWidth && x <= width - killZoneWidth &&
+                y >= killZoneWidth && y <= height - killZoneWidth) {
+              validPosition = true;
+            }
+          }
+          // If we couldn't find a valid position, use a safe default
+          if (!validPosition) {
+            x = width / 2 + Math.random() * 200 - 100;
+            y = height / 2 + Math.random() * 200 - 100;
+          }
+          const angle = Math.random() * Math.PI * 2;
+          const speed = Math.random() * 600 + 800; // Much stronger jets
+          jets.push({
+            x: x,
+            y: y,
+            pushX: Math.cos(angle) * speed,
+            pushY: Math.sin(angle) * speed,
+            active: false,
+            activationDelay: Math.random() * 0.3,
+            isInterior: true
+          });
+        }
+      }
+      generatePerimeterJets();
+
+      function isInKillZone(x, y) {
+        // Top border
+        if (y < killZoneWidth) return true;
+        // Bottom border
+        if (y > height - killZoneWidth) return true;
+        // Left border
+        if (x < killZoneWidth) return true;
+        // Right border
+        if (x > width - killZoneWidth) return true;
+        return false;
+      }
+
+      function spawnCollectionParticles(x, y) {
+        // Create burst of golden particles on key collection
+        for (let i = 0; i < 12; i++) {
+          const angle = (i / 12) * Math.PI * 2;
+          const speed = 150 + Math.random() * 100;
+          collectParticles.push({
+            x: x,
+            y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 0.6,
+            maxLife: 0.6,
+            size: 4 + Math.random() * 3
+          });
+        }
+        // Screen shake on collection
+        screenShakeAmount.x = (Math.random() - 0.5) * 8;
+        screenShakeAmount.y = (Math.random() - 0.5) * 8;
+      }
+
+      function spawnWindParticle(jet) {
+        jetParticles.push({
+          x: jet.x + (Math.random() - 0.5) * 40,
+          y: jet.y + (Math.random() - 0.5) * 40,
+          life: Math.random() * 0.4 + 0.2,
+          maxLife: Math.random() * 0.4 + 0.2
+        });
+      }
+
+      function resize() {
+        dpr = window.devicePixelRatio || 1;
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+        canvas.width = Math.floor(width * dpr);
+        canvas.height = Math.floor(height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        jets.length = 0; // Clear old jets
+        generatePerimeterJets(); // Regenerate for new screen size
+      }
+      window.addEventListener('resize', resize);
+      resize();
+      console.log('Game initialized. Width:', window.innerWidth, 'Height:', window.innerHeight);
+
+      function drawBackground() {
+        // Dark background - almost completely black
+        ctx.fillStyle = '#050505';
+        ctx.fillRect(0, 0, width, height);
+      }
+
+      function drawKeys() {
+        // Get flashlight direction
+        const dirX = player.mouseX - player.x;
+        const dirY = player.mouseY - player.y;
+        const dirLen = Math.hypot(dirX, dirY);
+        const dirNormX = dirLen > 0 ? dirX / dirLen : 1;
+        const dirNormY = dirLen > 0 ? dirY / dirLen : 0;
+        const dirAngle = Math.atan2(dirNormY, dirNormX);
+
+        for (const key of keys) {
+          if (key.collected) continue;
+
+          // Only draw if key is in flashlight cone
+          const kDist = Math.hypot(key.x - player.x, key.y - player.y);
+          if (kDist > flashlight.radius) continue;
+          
+          const kAngle = Math.atan2(key.y - player.y, key.x - player.x);
+          const angleDiff = Math.abs(((kAngle - dirAngle + Math.PI) % (Math.PI * 2)) - Math.PI);
+          if (angleDiff > flashlight.coneAngle / 2) continue;
+
+          // Animate key rotation
+          key.rotation += 2 * Math.PI * 0.5; // Continuous spin
+          
+          // Subtle bob animation
+          const bobAmount = Math.sin(timeSurvived * 3 + key.rotation) * 2;
+
+          ctx.save();
+          ctx.translate(key.x, key.y + bobAmount);
+          ctx.rotate(key.rotation);
+          
+          // Key shaft
+          ctx.fillStyle = '#FFD700';
+          ctx.fillRect(-8, -3, 16, 6);
+          
+          // Key head (circle)
+          ctx.beginPath();
+          ctx.arc(-10, 0, 6, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Key teeth
+          ctx.fillRect(4, -2, 3, 4);
+          ctx.fillRect(8, -2, 3, 4);
+          
+          ctx.restore();
+
+          // Outer glow effect
+          ctx.fillStyle = 'rgba(255, 215, 0, 0.15)';
+          ctx.beginPath();
+          ctx.arc(key.x, key.y + bobAmount, key.size + 12, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Inner bright glow
+          ctx.fillStyle = 'rgba(255, 215, 0, 0.25)';
+          ctx.beginPath();
+          ctx.arc(key.x, key.y + bobAmount, key.size + 6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function drawWindParticles() {
+        // Particles only visible in flashlight area
+        // Get flashlight direction
+        const dirX = player.mouseX - player.x;
+        const dirY = player.mouseY - player.y;
+        const dirLen = Math.hypot(dirX, dirY);
+        const dirNormX = dirLen > 0 ? dirX / dirLen : 1;
+        const dirNormY = dirLen > 0 ? dirY / dirLen : 0;
+        const dirAngle = Math.atan2(dirNormY, dirNormX);
+
+        for (const particle of jetParticles) {
+          // Only draw if particle is in flashlight cone
+          const pDist = Math.hypot(particle.x - player.x, particle.y - player.y);
+          if (pDist > flashlight.radius) continue;
+          
+          const pAngle = Math.atan2(particle.y - player.y, particle.x - player.x);
+          const angleDiff = Math.abs(((pAngle - dirAngle + Math.PI) % (Math.PI * 2)) - Math.PI);
+          if (angleDiff > flashlight.coneAngle / 2) continue;
+
+          const alpha = (particle.life / particle.maxLife) * 0.6;
+          ctx.fillStyle = `rgba(100, 150, 200, ${alpha})`;
+          ctx.beginPath();
+          ctx.arc(particle.x, particle.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function drawCollectionParticles() {
+        // Draw golden collection particles (visible everywhere)
+        for (const particle of collectParticles) {
+          const alpha = particle.life / particle.maxLife;
+          const size = particle.size * (1 - (1 - alpha)); // Shrink as they fade
+          
+          ctx.fillStyle = `rgba(255, 215, 0, ${alpha * 0.8})`;
+          ctx.beginPath();
+          ctx.arc(particle.x, particle.y, size, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Glow
+          ctx.strokeStyle = `rgba(255, 215, 0, ${alpha * 0.3})`;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
+
+      function drawFlashlight() {
+        // Get direction from player to mouse
+        const dirX = player.mouseX - player.x;
+        const dirY = player.mouseY - player.y;
+        const dirLen = Math.hypot(dirX, dirY);
+        const dirNormX = dirLen > 0 ? dirX / dirLen : 1;
+        const dirNormY = dirLen > 0 ? dirY / dirLen : 0;
+        const dirAngle = Math.atan2(dirNormY, dirNormX);
+
+        // Draw darkness outside flashlight cone
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.95)';
+        ctx.fillRect(0, 0, width, height);
+
+        // Draw flashlight revealed area with lighting effect
+        // Create a radial gradient for the flashlight glow
+        const lightGradient = ctx.createRadialGradient(player.x, player.y, 0, player.x, player.y, flashlight.radius);
+        lightGradient.addColorStop(0, 'rgba(100, 150, 200, 0.4)');
+        lightGradient.addColorStop(0.5, 'rgba(100, 150, 200, 0.15)');
+        lightGradient.addColorStop(1, 'rgba(100, 150, 200, 0)');
+        
+        // Draw the cone-shaped lit area using clipping
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        const leftAngle = dirAngle - flashlight.coneAngle / 2;
+        const rightAngle = dirAngle + flashlight.coneAngle / 2;
+        ctx.lineTo(
+          player.x + Math.cos(leftAngle) * flashlight.radius,
+          player.y + Math.sin(leftAngle) * flashlight.radius
+        );
+        ctx.arc(player.x, player.y, flashlight.radius, leftAngle, rightAngle);
+        ctx.lineTo(player.x, player.y);
+        ctx.clip();
+
+        // Fill the lit area with gradient (revealing the floor)
+        ctx.fillStyle = lightGradient;
+        ctx.fillRect(player.x - flashlight.radius, player.y - flashlight.radius, flashlight.radius * 2, flashlight.radius * 2);
+
+        // Draw subtle grid pattern on floor for visual depth
+        ctx.strokeStyle = 'rgba(100, 150, 200, 0.1)';
+        ctx.lineWidth = 1;
+        const gridSize = 50;
+        for (let x = 0; x < width; x += gridSize) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, height);
+          ctx.stroke();
+        }
+        for (let y = 0; y < height; y += gridSize) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+        }
+
+        ctx.restore();
+
+        // Draw red kill zone (always visible even in darkness)
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.4)';
+        if (isInKillZone(player.x, player.y)) {
+          ctx.fillRect(0, 0, width, killZoneWidth);
+          ctx.fillRect(0, height - killZoneWidth, width, killZoneWidth);
+          ctx.fillRect(0, 0, killZoneWidth, height);
+          ctx.fillRect(width - killZoneWidth, 0, killZoneWidth, height);
+        } else {
+          // Show kill zone edges if near them
+          const killZoneVisibleRadius = flashlight.radius + 100;
+          if (player.y < killZoneVisibleRadius) ctx.fillRect(0, 0, width, killZoneWidth);
+          if (height - player.y < killZoneVisibleRadius) ctx.fillRect(0, height - killZoneWidth, width, killZoneWidth);
+          if (player.x < killZoneVisibleRadius) ctx.fillRect(0, 0, killZoneWidth, height);
+          if (width - player.x < killZoneVisibleRadius) ctx.fillRect(width - killZoneWidth, 0, killZoneWidth, height);
+        }
+
+        // Draw flashlight cone boundary
+        ctx.strokeStyle = 'rgba(100, 150, 200, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        ctx.lineTo(
+          player.x + Math.cos(leftAngle) * flashlight.radius,
+          player.y + Math.sin(leftAngle) * flashlight.radius
+        );
+        ctx.arc(player.x, player.y, flashlight.radius, leftAngle, rightAngle);
+        ctx.lineTo(player.x, player.y);
+        ctx.stroke();
+      }
+
+      function update(dt) {
+        // Stop updating if game is not active
+        if (!gameActive) return;
+
+        let dx = 0, dy = 0;
+        if (keysPressed.w) dy -= 1;
+        if (keysPressed.s) dy += 1;
+        if (keysPressed.a) dx -= 1;
+        if (keysPressed.d) dx += 1;
+
+        if (dx !== 0 || dy !== 0) {
+          const len = Math.hypot(dx, dy);
+          dx /= len;
+          dy /= len;
+          player.x += dx * player.speed * dt;
+          player.y += dy * player.speed * dt;
+        }
+
+        // Jet activation system with cycles - jets activate, run for a duration, then deactivate
+        // This ensures the player always has time to collect keys
+        timeSurvived += dt;
+        difficulty = 1 + (timeSurvived * 0.15); // Slower difficulty scaling for balanced gameplay
+        
+        // Cycle-based jet system: each jet has an activation cycle
+        // Active phase: 2-4 seconds, Inactive phase: 1-3 seconds
+        for (const jet of jets) {
+          if (!jet.cycleTimer) {
+            jet.cycleTimer = 0;
+            jet.activeDuration = 2 + Math.random() * 2; // 2-4 seconds active
+            jet.inactiveDuration = 1 + Math.random() * 2; // 1-3 seconds inactive
+            jet.active = Math.random() > 0.5; // Start random
+          }
+          
+          jet.cycleTimer += dt;
+          
+          if (jet.active) {
+            if (jet.cycleTimer >= jet.activeDuration) {
+              jet.active = false;
+              jet.cycleTimer = 0;
+            }
+          } else {
+            if (jet.cycleTimer >= jet.inactiveDuration) {
+              jet.active = true;
+              jet.cycleTimer = 0;
+            }
+          }
+        }
+        
+        // Calculate how many jets should be active based on difficulty
+        const maxActiveJets = Math.min(Math.ceil(difficulty), jets.length);
+        let activeCount = jets.filter(j => j.active).length;
+        
+        // If we have too many active, randomly deactivate some
+        if (activeCount > maxActiveJets) {
+          const activeJets = jets.filter(j => j.active);
+          const toDeactivate = activeCount - maxActiveJets;
+          for (let i = 0; i < toDeactivate && activeJets.length > 0; i++) {
+            const idx = Math.floor(Math.random() * activeJets.length);
+            activeJets[idx].active = false;
+            activeJets.splice(idx, 1);
+          }
+        }
+
+        // Apply active jet forces to player
+        const jetRange = 350;
+        for (const jet of jets) {
+          if (jet.active) {
+            const distX = player.x - jet.x;
+            const distY = player.y - jet.y;
+            const dist = Math.hypot(distX, distY);
+            if (dist < jetRange) {
+              const forceFalloff = 1 - (dist / jetRange);
+              player.x += jet.pushX * dt * forceFalloff;
+              player.y += jet.pushY * dt * forceFalloff;
+            }
+          }
+        }
+
+        // Update wind particles
+        for (let i = jetParticles.length - 1; i >= 0; i--) {
+          jetParticles[i].life -= dt;
+          if (jetParticles[i].life <= 0) {
+            jetParticles.splice(i, 1);
+          }
+        }
+
+        // Update collection particles
+        for (let i = collectParticles.length - 1; i >= 0; i--) {
+          const p = collectParticles[i];
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.vy += 200 * dt; // Gravity
+          p.life -= dt;
+          if (p.life <= 0) {
+            collectParticles.splice(i, 1);
+          }
+        }
+
+        // Decay screen shake
+        screenShakeAmount.x *= 0.85;
+        screenShakeAmount.y *= 0.85;
+
+        // Check kill zone
+        if (isInKillZone(player.x, player.y)) {
+          // Game Over - player died
+          gameLost = true;
+          lastSurvivalTime = timeSurvived;
+          gameActive = false;
+          return;
+        }
+
+        // Check key collection
+        for (const key of keys) {
+          if (!key.collected) {
+            const kDist = Math.hypot(player.x - key.x, player.y - key.y);
+            if (kDist < player.size + key.size) {
+              key.collected = true;
+              keysCollected++;
+              spawnCollectionParticles(key.x, key.y);
+              if (keysCollected >= keysNeeded) {
+                gameWon = true;
+                gameActive = false;
+              }
+            }
+          }
+        }
+
+        // keep player within view
+        const pad = player.size / 2;
+        player.x = Math.max(pad, Math.min(width - pad, player.x));
+        player.y = Math.max(pad, Math.min(height - pad, player.y));
+      }
+
+      function drawPlayer() {
+        // Draw player with multiple glow layers for polish
+        const half = player.size / 2;
+        
+        // Outer glow (blue)
+        ctx.fillStyle = 'rgba(74, 158, 255, 0.1)';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, half + 25, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Mid glow
+        ctx.fillStyle = 'rgba(74, 158, 255, 0.15)';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, half + 18, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Main body
+        ctx.fillStyle = player.color;
+        ctx.fillRect(player.x - half, player.y - half, player.size, player.size);
+        
+        // Inner bright glow
+        ctx.fillStyle = 'rgba(100, 180, 255, 0.3)';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, half + 5, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Direction indicator (small arrow toward mouse)
+        const dirX = player.mouseX - player.x;
+        const dirY = player.mouseY - player.y;
+        const dirLen = Math.hypot(dirX, dirY);
+        if (dirLen > 0) {
+          const dirNormX = dirX / dirLen;
+          const dirNormY = dirY / dirLen;
+          const arrowLen = half + 3;
+          ctx.strokeStyle = 'rgba(100, 180, 255, 0.6)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(player.x + dirNormX * half, player.y + dirNormY * half);
+          ctx.lineTo(player.x + dirNormX * arrowLen, player.y + dirNormY * arrowLen);
+          ctx.stroke();
+        }
+      }
+
+      const fpsEl = document.getElementById('fps');
+      const memEl = document.getElementById('mem');
+      const timeEl = document.getElementById('time');
+      const difficultyEl = document.getElementById('difficulty');
+      const leaderboardPreviewEl = document.getElementById('leaderboardPreview');
+      let last = performance.now();
+      let fpsSmoothed = 0;
+      
+      function saveLeaderboardEntry(time) {
+        const entry = {
+          time: time,
+          difficulty: difficulty,
+          date: new Date().toLocaleString()
+        };
+        leaderboard.push(entry);
+        leaderboard.sort((a, b) => b.time - a.time);
+        leaderboard = leaderboard.slice(0, maxLeaderboardEntries);
+        localStorage.setItem('gameLeaderboard', JSON.stringify(leaderboard));
+      }
+      
+      function getLeaderboardHTML() {
+        if (leaderboard.length === 0) {
+          return '<div style="color:#999; font-size:11px;">No scores yet. Survive to appear!</div>';
+        }
+        let html = '<div style="font-size:11px;">';
+        for (let i = 0; i < Math.min(5, leaderboard.length); i++) {
+          const entry = leaderboard[i];
+          const color = i === 0 ? '#FFD700' : '#d8e4ff';
+          html += `<div style="color:${color}; margin:3px 0;">#${i + 1}: ${entry.time.toFixed(1)}s (${entry.difficulty.toFixed(1)}x)</div>`;
+        }
+        html += '</div>';
+        return html;
+      }
+
+      // Menu functions removed - no menu system
+      
+      function startGame() {
+        timeSurvived = 0;
+        difficulty = 1;
+        gameWon = false;
+        gameLost = false;
+        keysCollected = 0;
+        jetActivationTimer = 0;
+        player.x = width / 2;
+        player.y = height / 2;
+        generateKeys();
+        jets.length = 0;
+        generatePerimeterJets();
+        gameActive = true;
+      }
+
+      window.startGame = startGame;
+
+      function loop(now) {
+        const dt = Math.min((now - last) / 1000, 0.25);
+        last = now;
+        const fps = 1 / dt;
+        fpsSmoothed = fpsSmoothed ? fpsSmoothed * 0.9 + fps * 0.1 : fps;
+
+        update(dt);
+
+        ctx.clearRect(0, 0, width, height);
+        
+        // Apply screen shake
+        ctx.save();
+        ctx.translate(screenShakeAmount.x, screenShakeAmount.y);
+        
+        drawBackground();
+        drawFlashlight();
+        drawKeys();
+        drawWindParticles();
+        drawCollectionParticles();
+        drawPlayer();
+        
+        ctx.restore();
+
+        fpsEl.textContent = 'FPS: ' + fpsSmoothed.toFixed(1);
+        if (performance.memory) {
+          const used = performance.memory.usedJSHeapSize / 1048576;
+          const total = performance.memory.jsHeapSizeLimit / 1048576;
+          memEl.textContent = 'Memory: ' + used.toFixed(1) + ' / ' + total.toFixed(0) + ' MB';
+        } else {
+          memEl.textContent = 'Memory: N/A';
+        }
+        timeEl.textContent = 'Time: ' + timeSurvived.toFixed(1) + 's';
+        const difficultyLevel = Math.floor(difficulty);
+        difficultyEl.textContent = 'Difficulty: ' + difficultyLevel + ' jets | Keys: ' + keysCollected + '/' + keysNeeded + ' | Best: ' + highScore.toFixed(1) + 's';
+        leaderboardPreviewEl.innerHTML = getLeaderboardHTML();
+        
+        // Display win message
+        if (gameWon) {
+          // Update high score and leaderboard
+          if (timeSurvived > highScore) {
+            highScore = timeSurvived;
+            localStorage.setItem('gameHighScore', highScore.toString());
+          }
+          saveLeaderboardEntry(timeSurvived);
+          gameActive = false;
+          
+          // Beautiful gradient overlay
+          const winGradient = ctx.createLinearGradient(0, 0, 0, height);
+          winGradient.addColorStop(0, 'rgba(0, 0, 0, 0.6)');
+          winGradient.addColorStop(1, 'rgba(0, 50, 100, 0.7)');
+          ctx.fillStyle = winGradient;
+          ctx.fillRect(0, 0, width, height);
+          
+          // Glow effect around text
+          ctx.shadowColor = 'rgba(0, 255, 100, 0.5)';
+          ctx.shadowBlur = 20;
+          
+          ctx.fillStyle = '#00FF99';
+          ctx.font = 'bold 72px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('SYSTEM SHUTDOWN!', width / 2, height / 2 - 60);
+          
+          ctx.shadowColor = 'transparent';
+          ctx.fillStyle = '#00DD88';
+          ctx.font = '32px Arial';
+          ctx.fillText('Wind neutralized - You Survived!', width / 2, height / 2 - 10);
+          
+          ctx.fillStyle = '#88FFCC';
+          ctx.font = '24px Arial';
+          ctx.fillText('Time: ' + timeSurvived.toFixed(1) + 's | Difficulty: ' + difficulty.toFixed(1) + 'x', width / 2, height / 2 + 30);
+          
+          if (timeSurvived > highScore - timeSurvived * 0.01) {
+            ctx.fillStyle = '#FFD700';
+            ctx.font = 'bold 28px Arial';
+            ctx.fillText('🏆 NEW RECORD!', width / 2, height / 2 + 75);
+          }
+          
+          ctx.fillStyle = '#999';
+          ctx.font = '18px Arial';
+          ctx.fillText('Press SPACE to play again', width / 2, height / 2 + 130);
+        }
+        
+        // Display death message
+        if (gameLost && !gameActive) {
+          // Red gradient overlay
+          const lossGradient = ctx.createLinearGradient(0, 0, 0, height);
+          lossGradient.addColorStop(0, 'rgba(0, 0, 0, 0.6)');
+          lossGradient.addColorStop(1, 'rgba(100, 0, 20, 0.7)');
+          ctx.fillStyle = lossGradient;
+          ctx.fillRect(0, 0, width, height);
+          
+          ctx.shadowColor = 'rgba(255, 50, 50, 0.5)';
+          ctx.shadowBlur = 20;
+          
+          ctx.fillStyle = '#FF5555';
+          ctx.font = 'bold 72px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('SYSTEM BREACHED!', width / 2, height / 2 - 60);
+          
+          ctx.shadowColor = 'transparent';
+          ctx.fillStyle = '#FF7777';
+          ctx.font = '32px Arial';
+          ctx.fillText('You were caught by the wind!', width / 2, height / 2 - 10);
+          
+          ctx.fillStyle = '#FFAAAA';
+          ctx.font = '24px Arial';
+          ctx.fillText('Survived: ' + lastSurvivalTime.toFixed(1) + 's', width / 2, height / 2 + 30);
+          
+          ctx.fillStyle = '#999';
+          ctx.font = '18px Arial';
+          ctx.fillText('Press SPACE to try again', width / 2, height / 2 + 85);
+        }
+
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+      
+      // Generate keys after everything is initialized
+      generateKeys();
+      console.log('Game initialized. Total jets:', jets.length, 'Total keys:', keys.length);
+      
+      // Start game immediately
+      startGame();
+
+      window.addEventListener('keydown', (e) => {
+        const k = e.key.toLowerCase();
+        
+        // Restart with SPACE when game ends
+        if (k === ' ' && (gameWon || gameLost)) {
+          startGame();
+          return;
+        }
+        
+        // Process movement controls directly
+        if (k === 'w') keysPressed.w = true;
+        if (k === 's') keysPressed.s = true;
+        if (k === 'a') keysPressed.a = true;
+        if (k === 'd') keysPressed.d = true;
+      });
+      window.addEventListener('keyup', (e) => {
+        const k = e.key.toLowerCase();
+        if (k === 'w') keysPressed.w = false;
+        if (k === 's') keysPressed.s = false;
+        if (k === 'a') keysPressed.a = false;
+        if (k === 'd') keysPressed.d = false;
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        player.mouseX = e.clientX;
+        player.mouseY = e.clientY;
+      });
+    })();
+  </script>
+</body>
+</html>
